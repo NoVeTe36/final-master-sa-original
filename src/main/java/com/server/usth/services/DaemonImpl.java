@@ -10,6 +10,8 @@ import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.List;
+import java.util.Set;
 
 // File: DaemonImpl.java
 public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
@@ -53,38 +55,58 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             Directory directory = (Directory) registry.lookup("Directory");
             directory.registerDaemon(daemonId, this);
 
+            System.out.println("Daemon " + daemonId + " is running...");
+
             // Ensure storage directory exists
             File storage = new File(storageDirectory);
             if (!storage.exists()) {
-                System.out.println("Storage directory does not exist. Creating: " + storageDirectory);
-                if (!storage.mkdirs()) {
-                    System.err.println("Failed to create storage directory.");
-                    return;
+                storage.mkdirs();
+            }
+
+            // Step 1: Get the list of all available files
+            Set<String> availableFiles = directory.getAvailableFiles();
+
+            for (String filename : availableFiles) {
+                File localFile = new File(storageDirectory, filename);
+
+                if (!localFile.exists()) {
+                    System.out.println("File " + filename + " is missing. Requesting from other daemons...");
+
+                    List<DaemonService> sourceDaemons = directory.getDaemonsForFile(filename);
+
+                    if (!sourceDaemons.isEmpty()) {
+                        requestFileFromDaemons(filename, sourceDaemons);
+                    }
                 }
             }
 
-            // Check if it's actually a directory
-            if (!storage.isDirectory()) {
-                System.err.println("Storage path is not a directory: " + storageDirectory);
-                return;
-            }
-
-            // Register available files
-            File[] files = storage.listFiles();
-            if (files != null) {
-                for (File file : files) {
-                    directory.registerFile(file.getName(), daemonId);
-                }
-            } else {
-                System.out.println("No files found in the storage directory.");
-            }
-
-            System.out.println("Daemon " + daemonId + " is running...");
+            System.out.println("Daemon " + daemonId + " file recovery completed.");
         } catch (Exception e) {
             System.err.println("Daemon exception: " + e.toString());
             e.printStackTrace();
         }
     }
+
+    private void requestFileFromDaemons(String filename, List<DaemonService> sourceDaemons) {
+        for (DaemonService sourceDaemon : sourceDaemons) {
+            try {
+                long fileSize = sourceDaemon.getFileSize(filename);
+                byte[] data = sourceDaemon.downloadChunk(filename, 0, (int) fileSize);
+
+                File file = new File(storageDirectory, filename);
+                try (FileOutputStream fos = new FileOutputStream(file)) {
+                    fos.write(data);
+                }
+
+                System.out.println("Recovered file: " + filename);
+                return; // Exit after successful recovery
+            } catch (Exception e) {
+                System.err.println("Failed to recover " + filename + " from a daemon. Trying another...");
+            }
+        }
+        System.err.println("Failed to recover " + filename + " from any daemon.");
+    }
+
 
     @Override
     public void receiveFile(String filename, byte[] data) throws RemoteException {

@@ -56,17 +56,32 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
     }
 
-
     @Override
     public List<DaemonService> getDaemonsForFile(String filename) throws RemoteException {
         Set<String> daemonIds = fileRegistry.getOrDefault(filename, Collections.emptySet());
         List<DaemonService> availableDaemons = new ArrayList<>();
+        List<String> toRemove = new ArrayList<>();
+
         for (String id : daemonIds) {
             DaemonService daemon = daemons.get(id);
             if (daemon != null) {
-                availableDaemons.add(daemon);
+                try {
+                    daemon.getDaemonId(); // Ping daemon
+                    availableDaemons.add(daemon);
+                } catch (RemoteException e) {
+                    System.out.println("Removing offline daemon: " + id);
+                    toRemove.add(id);
+                }
             }
         }
+
+        // Remove dead daemons from the registry
+        for (String id : toRemove) {
+            daemons.remove(id);
+            fileRegistry.get(filename).remove(id);
+        }
+
+        System.out.println("Returning daemons for file " + filename + ": " + availableDaemons.size());
         return availableDaemons;
     }
 

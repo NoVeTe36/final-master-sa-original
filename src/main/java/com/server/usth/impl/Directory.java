@@ -14,4 +14,5 @@ public interface Directory extends Remote {
     void registerDaemon(String daemonId, DaemonService daemon) throws RemoteException;
     void registerFile(String filename, String daemonId) throws RemoteException;
     List<DaemonService> getDaemonsForFile(String filename) throws RemoteException;
+    Set<String> getAvailableFiles() throws RemoteException;
 }
