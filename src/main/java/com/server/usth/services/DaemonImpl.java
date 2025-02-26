@@ -24,8 +24,6 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         this.storageDirectory = storageDirectory;
     }
 
-
-
     @Override
     public byte[] downloadChunk(String filename, long offset, int size) throws RemoteException {
         try (RandomAccessFile file = new RandomAccessFile(storageDirectory + "/" + filename, "r")) {
