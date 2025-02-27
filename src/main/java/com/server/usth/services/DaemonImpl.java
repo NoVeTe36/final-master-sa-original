@@ -51,25 +51,35 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         try {
             Registry registry = LocateRegistry.getRegistry("localhost", 1099);
             Directory directory = (Directory) registry.lookup("Directory");
-            directory.registerDaemon(daemonId, this);
 
+            // ✅ Register daemon first
+            directory.registerDaemon(daemonId, this);
             System.out.println("Daemon " + daemonId + " is running...");
 
-            // Ensure storage directory exists
+            // ✅ Ensure storage directory exists
             File storage = new File(storageDirectory);
             if (!storage.exists()) {
                 storage.mkdirs();
             }
 
-            // Step 1: Get the list of all available files
-            Set<String> availableFiles = directory.getAvailableFiles();
+            // ✅ Scan for existing files and register them
+            File[] files = storage.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    if (file.isFile()) {
+                        System.out.println("Registering existing file: " + file.getName());
+                        directory.registerFile(file.getName(), daemonId);
+                    }
+                }
+            }
 
+            // ✅ Step 1: Get the list of all available files from Directory
+            Set<String> availableFiles = directory.getAvailableFiles();
             for (String filename : availableFiles) {
                 File localFile = new File(storageDirectory, filename);
 
                 if (!localFile.exists()) {
                     System.out.println("File " + filename + " is missing. Requesting from other daemons...");
-
                     List<DaemonService> sourceDaemons = directory.getDaemonsForFile(filename);
 
                     if (!sourceDaemons.isEmpty()) {
