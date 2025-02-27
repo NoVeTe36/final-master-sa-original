@@ -17,4 +17,3 @@ public interface DaemonService extends Remote {
     void receiveFile(String filename, byte[] data) throws RemoteException;
     String getDaemonId() throws RemoteException;
 }
-

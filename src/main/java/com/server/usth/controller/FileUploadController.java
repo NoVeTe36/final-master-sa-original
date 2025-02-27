@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.beans.factory.annotation.Autowired;
 import com.server.usth.impl.DirectoryImpl;
+
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,6 +27,10 @@ public class FileUploadController {
     @PostMapping
     public ResponseEntity<String> uploadFile(@RequestParam("file") MultipartFile file) {
         try {
+            File dir = new File(uploadDirectory);
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
             // Save the file
             String filename = file.getOriginalFilename();
             Path path = Paths.get(uploadDirectory, filename);
@@ -52,7 +57,4 @@ public class FileUploadController {
             return ResponseEntity.badRequest().body("Failed to upload file: " + e.getMessage());
         }
     }
-
-
-
 }
