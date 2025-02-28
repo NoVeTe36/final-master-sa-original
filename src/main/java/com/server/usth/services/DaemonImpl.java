@@ -1,7 +1,5 @@
 package com.server.usth.services;
 
-import com.server.usth.impl.Directory;
-
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -12,11 +10,20 @@ import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
-// File: DaemonImpl.java
+import com.server.usth.impl.Directory;
+
 public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
     private final String daemonId;
     private final String storageDirectory;
+    private Directory directory;
+    private Registry registry;
+    private ScheduledExecutorService heartbeatScheduler;
+    private ScheduledExecutorService fileMonitorScheduler;
+    private final long scanInterval = 30; // Seconds between file system scans
 
     public DaemonImpl(String daemonId, String storageDirectory) throws RemoteException {
         super();
@@ -24,20 +31,23 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         this.storageDirectory = storageDirectory;
     }
 
-    @Override
-    public byte[] downloadChunk(String filename, long offset, int size) throws RemoteException {
-        try (RandomAccessFile file = new RandomAccessFile(storageDirectory + "/" + filename, "r")) {
+    public byte[] downloadChunk(String fileName, long offset, int size) throws RemoteException {
+        File file = new File(storageDirectory, fileName);
+        if (!file.exists() || size <= 0) {
+            return new byte[0];
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            raf.seek(offset);
             byte[] chunk = new byte[size];
-            file.seek(offset);
-            int bytesRead = file.read(chunk);
-            if (bytesRead < size) {
-                byte[] actualChunk = new byte[bytesRead];
-                System.arraycopy(chunk, 0, actualChunk, 0, bytesRead);
-                return actualChunk;
+            int bytesRead = raf.read(chunk);
+            if (bytesRead < size && bytesRead > 0) {
+                byte[] partial = new byte[bytesRead];
+                System.arraycopy(chunk, 0, partial, 0, bytesRead);
+                return partial;
             }
             return chunk;
         } catch (IOException e) {
-            throw new RemoteException("Error reading chunk", e);
+            throw new RemoteException("Chunk read error", e);
         }
     }
 
@@ -47,23 +57,74 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         return file.length();
     }
 
+    @Override
+    public void receiveFile(String filename, byte[] data) throws RemoteException {
+        try {
+            File file = new File(storageDirectory, filename);
+            try (FileOutputStream fos = new FileOutputStream(file)) {
+                fos.write(data);
+            }
+            System.out.println("Received and stored file: " + filename);
+
+            // Register the newly received file
+            try {
+                directory.registerFile(filename, daemonId);
+            } catch (Exception e) {
+                System.err.println("Failed to register received file: " + e.getMessage());
+            }
+        } catch (IOException e) {
+            throw new RemoteException("Error saving file", e);
+        }
+    }
+
+    @Override
+    public String getDaemonId() throws RemoteException {
+        return daemonId;
+    }
+
     public void start() {
         try {
-            Registry registry = LocateRegistry.getRegistry("localhost", 1099);
-            Directory directory = (Directory) registry.lookup("Directory");
+            registry = LocateRegistry.getRegistry("localhost", 1099);
+            directory = (Directory) registry.lookup("Directory");
 
-            // ✅ Register daemon first
+            // Bind this daemon in the registry for discovery
+            registry.rebind(daemonId, this);
+
+            // Register with directory service
             directory.registerDaemon(daemonId, this);
             System.out.println("Daemon " + daemonId + " is running...");
 
-            // ✅ Ensure storage directory exists
+            // Create storage directory if it doesn't exist
             File storage = new File(storageDirectory);
             if (!storage.exists()) {
                 storage.mkdirs();
             }
 
-            // ✅ Scan for existing files and register them
-            File[] files = storage.listFiles();
+            // Register existing files
+            registerExistingFiles();
+
+            // Start heartbeat scheduler
+            startHeartbeatScheduler();
+
+            // Start file monitoring
+            startFileMonitoring();
+
+            // Synchronize missing files
+            syncMissingFiles();
+
+            System.out.println("Daemon " + daemonId + " initialization completed.");
+
+            // Keep daemon running
+            Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
+        } catch (Exception e) {
+            System.err.println("Daemon exception: " + e.toString());
+            e.printStackTrace();
+        }
+    }
+
+    private void registerExistingFiles() {
+        try {
+            File[] files = new File(storageDirectory).listFiles();
             if (files != null) {
                 for (File file : files) {
                     if (file.isFile()) {
@@ -72,9 +133,50 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
                     }
                 }
             }
+        } catch (Exception e) {
+            System.err.println("Error registering existing files: " + e.getMessage());
+        }
+    }
 
-            // ✅ Step 1: Get the list of all available files from Directory
+    private void startHeartbeatScheduler() {
+        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
+        heartbeatScheduler.scheduleAtFixedRate(() -> {
+            try {
+                directory.heartbeat(daemonId);
+            } catch (Exception e) {
+                System.err.println("Failed to send heartbeat: " + e.getMessage());
+            }
+        }, 0, 10, TimeUnit.SECONDS);
+    }
+
+    private void startFileMonitoring() {
+        fileMonitorScheduler = Executors.newSingleThreadScheduledExecutor();
+        fileMonitorScheduler.scheduleAtFixedRate(() -> {
+            try {
+                File[] files = new File(storageDirectory).listFiles();
+                if (files != null) {
+                    for (File file : files) {
+                        if (file.isFile()) {
+                            try {
+                                directory.registerFile(file.getName(), daemonId);
+                            } catch (Exception e) {
+                                // Ignore if file is already registered
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Error in file monitoring: " + e.getMessage());
+            }
+        }, scanInterval, scanInterval, TimeUnit.SECONDS);
+    }
+
+    private void syncMissingFiles() {
+        try {
+            // Get all available files from directory service
             Set<String> availableFiles = directory.getAvailableFiles();
+            System.out.println("Checking for missing files. Available files in network: " + availableFiles.size());
+
             for (String filename : availableFiles) {
                 File localFile = new File(storageDirectory, filename);
 
@@ -87,51 +189,93 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
                     }
                 }
             }
-
-            System.out.println("Daemon " + daemonId + " file recovery completed.");
+            System.out.println("File synchronization completed.");
         } catch (Exception e) {
-            System.err.println("Daemon exception: " + e.toString());
-            e.printStackTrace();
+            System.err.println("Error during file synchronization: " + e.getMessage());
         }
     }
 
     private void requestFileFromDaemons(String filename, List<DaemonService> sourceDaemons) {
         for (DaemonService sourceDaemon : sourceDaemons) {
             try {
-                long fileSize = sourceDaemon.getFileSize(filename);
-                byte[] data = sourceDaemon.downloadChunk(filename, 0, (int) fileSize);
-
-                File file = new File(storageDirectory, filename);
-                try (FileOutputStream fos = new FileOutputStream(file)) {
-                    fos.write(data);
+                // Skip self
+                if (sourceDaemon.getDaemonId().equals(daemonId)) {
+                    continue;
                 }
 
-                System.out.println("Recovered file: " + filename);
-                return; // Exit after successful recovery
+                long fileSize = sourceDaemon.getFileSize(filename);
+                if (fileSize <= 0) {
+                    continue; // Skip if file size is invalid
+                }
+
+                System.out.println("Requesting " + filename + " (" + fileSize + " bytes) from " +
+                        sourceDaemon.getDaemonId());
+
+                // For large files, download in chunks
+                if (fileSize > 50 * 1024 * 1024) { // 50MB threshold
+                    downloadLargeFile(filename, fileSize, sourceDaemon);
+                } else {
+                    // For smaller files, download in one go
+                    byte[] data = sourceDaemon.downloadChunk(filename, 0, (int) fileSize);
+                    if (data != null && data.length > 0) {
+                        File file = new File(storageDirectory, filename);
+                        try (FileOutputStream fos = new FileOutputStream(file)) {
+                            fos.write(data);
+                        }
+                        System.out.println("Recovered file: " + filename);
+
+                        // Register the file
+                        directory.registerFile(filename, daemonId);
+                        return; // Exit after successful recovery
+                    }
+                }
             } catch (Exception e) {
-                System.err.println("Failed to recover " + filename + " from a daemon. Trying another...");
+                System.err.println("Failed to recover " + filename + " from daemon " +
+                        "trying another daemon: " + e.getMessage());
             }
         }
         System.err.println("Failed to recover " + filename + " from any daemon.");
     }
 
+    private void downloadLargeFile(String filename, long fileSize, DaemonService sourceDaemon) throws Exception {
+        final int CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+        int numChunks = (int) Math.ceil((double) fileSize / CHUNK_SIZE);
 
-    @Override
-    public void receiveFile(String filename, byte[] data) throws RemoteException {
-        try {
-            File file = new File(storageDirectory, filename);
-            try (FileOutputStream fos = new FileOutputStream(file)) {
-                fos.write(data);
+        File outputFile = new File(storageDirectory, filename);
+        try (RandomAccessFile raf = new RandomAccessFile(outputFile, "rw")) {
+            raf.setLength(fileSize); // Pre-allocate file
+
+            for (int i = 0; i < numChunks; i++) {
+                long offset = i * (long) CHUNK_SIZE;
+                int size = (int) Math.min(CHUNK_SIZE, fileSize - offset);
+
+                byte[] chunk = sourceDaemon.downloadChunk(filename, offset, size);
+                if (chunk != null && chunk.length > 0) {
+                    raf.seek(offset);
+                    raf.write(chunk);
+                    System.out.println("Downloaded chunk " + (i+1) + "/" + numChunks +
+                            " of " + filename + " (" + chunk.length + " bytes)");
+                } else {
+                    throw new IOException("Failed to download chunk " + i);
+                }
             }
-            System.out.println("Received and stored file: " + filename);
-        } catch (IOException e) {
-            throw new RemoteException("Error saving file", e);
         }
+
+        System.out.println("Successfully downloaded large file: " + filename);
+        // Register the file
+        directory.registerFile(filename, daemonId);
     }
 
-    @Override
-    public String getDaemonId() throws RemoteException {
-        return daemonId;
+    private void shutdown() {
+        System.out.println("Shutting down daemon...");
+
+        if (heartbeatScheduler != null) {
+            heartbeatScheduler.shutdownNow();
+        }
+
+        if (fileMonitorScheduler != null) {
+            fileMonitorScheduler.shutdownNow();
+        }
     }
 
     public static void main(String[] args) {
@@ -148,5 +292,4 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             e.printStackTrace();
         }
     }
-
 }

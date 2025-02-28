@@ -12,13 +12,13 @@ import java.util.List;
 import java.util.concurrent.*;
 
 public class ClientDownloader extends UnicastRemoteObject implements DaemonService {
-    private final String clientId;
+    private final String daemonId;
     private final String filename;
     private final String downloadPath;
     private Directory directory;
 
-    public ClientDownloader(String clientId, String filename, String downloadPath) throws RemoteException {
-        this.clientId = clientId;
+    public ClientDownloader(String daemonId, String filename, String downloadPath) throws RemoteException {
+        this.daemonId = daemonId;
         this.filename = filename;
         this.downloadPath = downloadPath;
     }
@@ -27,31 +27,21 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
         Registry registry = LocateRegistry.getRegistry("localhost", 1099);
         directory = (Directory) registry.lookup("Directory");
 
-        String actualClientId = (clientId == null || clientId.isEmpty() || clientId.equals("auto"))
-                ? directory.getUniqueClientId()
-                : clientId;
+        // Download logic
+        download();
 
-        // Register this as a client instead of a daemon
-        directory.registerClient(actualClientId, this);
+        // Register this client as a daemon after download
+        directory.registerDaemon(daemonId, this);
 
         // Start heartbeat
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
-                directory.heartbeat(actualClientId);
+                directory.heartbeat(daemonId);
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }, 0, 10, TimeUnit.SECONDS);
-
-        // Download logic
-        download();
-
-        // Optional: Unregister after download complete
-        // directory.unregisterClient(actualClientId);
-
-        // Shut down the heartbeat scheduler
-        scheduler.shutdown();
     }
 
     public void download() {
@@ -61,26 +51,64 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
                 System.out.println("No daemons found for file: " + filename);
                 return;
             }
-            long fileSize = daemons.get(0).getFileSize(filename);
-            int chunkSize = (int) Math.ceil((double) fileSize / daemons.size());
-            ExecutorService executor = Executors.newFixedThreadPool(4);
-            byte[][] fileChunks = new byte[daemons.size()][];
 
-            for (int i = 0; i < daemons.size(); i++) {
+            // Get file size from the first daemon that returns a valid size
+            long fileSize = 0;
+            for (DaemonService daemon : daemons) {
+                try {
+                    long size = daemon.getFileSize(filename);
+                    if (size > 0) {
+                        fileSize = size;
+                        break;
+                    }
+                } catch (Exception e) {
+                    // Continue to next daemon
+                }
+            }
+
+            if (fileSize <= 0) {
+                System.out.println("Could not determine file size for: " + filename);
+                return;
+            }
+
+            // Determine chunk size and distribution
+            int totalDaemons = daemons.size();
+            int chunkSize = (int) Math.ceil((double) fileSize / totalDaemons);
+
+            ExecutorService executor = Executors.newFixedThreadPool(totalDaemons);
+            byte[][] fileChunks = new byte[totalDaemons][];
+
+            CountDownLatch latch = new CountDownLatch(totalDaemons);
+
+            for (int i = 0; i < totalDaemons; i++) {
                 final int index = i;
+                final long offset = index * (long)chunkSize;
+                final int size = (int) Math.min(chunkSize, fileSize - offset);
+
                 executor.submit(() -> {
                     try {
                         DaemonService daemon = daemons.get(index);
-                        System.out.println("Downloading chunk " + index + " from daemon: " + daemon.getDaemonId());
-                        fileChunks[index] = daemon.downloadChunk(filename, index * chunkSize, chunkSize);
+                        System.out.println("Downloading chunk " + index + " from: " +
+                                daemon.getDaemonId() + " (offset: " + offset +
+                                ", size: " + size + ")");
+
+                        // Only download if size is valid
+                        if (size > 0) {
+                            fileChunks[index] = daemon.downloadChunk(filename, offset, size);
+                        } else {
+                            fileChunks[index] = new byte[0];
+                        }
                     } catch (Exception e) {
                         e.printStackTrace();
+                    } finally {
+                        latch.countDown();
                     }
                 });
             }
 
+            // Wait for all downloads to complete
+            latch.await(1, TimeUnit.MINUTES);
             executor.shutdown();
-            executor.awaitTermination(1, TimeUnit.MINUTES);
 
             mergeChunks(fileChunks);
         } catch (Exception e) {
@@ -103,39 +131,30 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 
     @Override
     public byte[] downloadChunk(String file, long offset, int size) throws RemoteException {
-        // Not syncing, return empty array
-        return new byte[0];
+        return null;
     }
 
     @Override
     public long getFileSize(String file) throws RemoteException {
-        return 0L; // Not syncing
+        return 0L;
     }
 
     @Override
     public void receiveFile(String file, byte[] data) throws RemoteException {
-        // Clients don't need to receive files for syncing
     }
 
     @Override
     public String getDaemonId() throws RemoteException {
-        return clientId;
+        return daemonId;
     }
 
     public static void main(String[] args) {
-        if (args.length < 2 || args.length > 3) {
-            System.out.println("Usage: java ClientDownloader [clientId] <filename> <downloadPath>");
+        if (args.length != 3) {
+            System.out.println("Usage: java ClientDownloader <daemonId> <filename> <downloadPath>");
             return;
         }
-
         try {
-            ClientDownloader client;
-            if (args.length == 2) {
-                // Auto-generate client ID
-                client = new ClientDownloader("auto", args[0], args[1]);
-            } else {
-                client = new ClientDownloader(args[0], args[1], args[2]);
-            }
+            ClientDownloader client = new ClientDownloader(args[0], args[1], args[2]);
             client.startClient();
         } catch (Exception e) {
             e.printStackTrace();
