@@ -1,13 +1,13 @@
 package com.server.usth.impl;
 
 import com.server.usth.services.DaemonService;
+import com.server.usth.services.Directory;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Autowired;
 import java.rmi.RemoteException;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
@@ -15,10 +15,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Service
 public class DirectoryImpl extends UnicastRemoteObject implements Directory {
@@ -30,8 +30,7 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     private final Map<String, Set<String>> fileRegistry = new ConcurrentHashMap<>();
     private final Map<String, Long> lastHeartbeats = new ConcurrentHashMap<>();
 
-    private final AtomicInteger daemonCounter = new AtomicInteger(1);
-    private final AtomicInteger clientCounter = new AtomicInteger(1);
+    private final Map<String, AtomicInteger> daemonLoads = new ConcurrentHashMap<>();
 
     private ScheduledExecutorService heartbeatChecker;
 
@@ -68,12 +67,10 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
 
         for (String nodeId : inactiveNodes) {
-            // Remove from the appropriate collection
             if (nodeId.startsWith("daemon")) {
                 daemons.remove(nodeId);
                 System.out.println("Daemon removed due to inactivity: " + nodeId);
 
-                // Also remove from file registry
                 for (Set<String> daemonSet : fileRegistry.values()) {
                     daemonSet.remove(nodeId);
                 }
@@ -87,20 +84,24 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     }
 
     @Override
-    public synchronized String getUniqueDaemonId() throws RemoteException {
-        return "daemon" + daemonCounter.getAndIncrement();
+    public void incrementDaemonLoad(String daemonId) throws RemoteException {
+        daemonLoads.computeIfAbsent(daemonId, k -> new AtomicInteger(0)).incrementAndGet();
+        System.out.println("Daemon " + daemonId + " load increased to: " + daemonLoads.get(daemonId).get());
     }
 
     @Override
-    public synchronized String getUniqueClientId() throws RemoteException {
-        return "client" + clientCounter.getAndIncrement();
+    public void decrementDaemonLoad(String daemonId) throws RemoteException {
+        AtomicInteger counter = daemonLoads.get(daemonId);
+        if (counter != null && counter.get() > 0) {
+            counter.decrementAndGet();
+            System.out.println("Daemon " + daemonId + " load decreased to: " + counter.get());
+        }
     }
 
     @Override
-    public void registerClient(String clientId, DaemonService client) throws RemoteException {
-        clients.put(clientId, client);
-        lastHeartbeats.put(clientId, System.currentTimeMillis());
-        System.out.println("Client registered: " + clientId);
+    public int getDaemonLoad(String daemonId) throws RemoteException {
+        AtomicInteger counter = daemonLoads.get(daemonId);
+        return counter != null ? counter.get() : 0;
     }
 
     @Override
@@ -121,7 +122,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
             System.out.println("Client registered: " + daemonId);
         }
 
-        // Register for heartbeats regardless of type
         lastHeartbeats.put(daemonId, System.currentTimeMillis());
     }
 
@@ -129,23 +129,12 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     public void registerFile(String filename, String daemonId) throws RemoteException {
         fileRegistry.computeIfAbsent(filename, k -> ConcurrentHashMap.newKeySet()).add(daemonId);
         System.out.println("File registered: " + filename + " by daemon: " + daemonId);
-
-        if (fileRegistry.get(filename).size() == 1) {
-            System.out.println("Assigning " + filename + " to all active daemons...");
-            // Assign to all daemons
-            for (String activeDaemon : daemons.keySet()) {
-                if (!activeDaemon.equals(daemonId)) {  // Avoid adding the same daemon twice
-                    fileRegistry.get(filename).add(activeDaemon);
-                    System.out.println("File " + filename + " assigned to daemon: " + activeDaemon);
-                }
-            }
-        }
     }
 
     @Override
     public List<DaemonService> getDaemonsForFile(String filename) throws RemoteException {
         Set<String> daemonIds = fileRegistry.getOrDefault(filename, Collections.emptySet());
-        List<DaemonService> availableDaemons = new ArrayList<>();
+        List<DaemonInfo> daemonInfos = new ArrayList<>();
         List<String> toRemove = new ArrayList<>();
 
         // First check current heartbeats to avoid trying dead daemons
@@ -161,8 +150,16 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
             DaemonService daemon = daemons.get(id);
             if (daemon != null) {
                 try {
-                    daemon.getDaemonId(); // Ping the daemon to ensure it's responsive
-                    availableDaemons.add(daemon);
+                    // Verify daemon has the file by checking its size
+                    long fileSize = daemon.getFileSize(filename);
+                    if (fileSize > 0) {
+                        // Get the current load for this daemon
+                        int load = getDaemonLoad(id);
+                        daemonInfos.add(new DaemonInfo(daemon, load));
+                    } else {
+                        System.out.println("Daemon " + id + " doesn't have file: " + filename);
+                        toRemove.add(id);
+                    }
                 } catch (RemoteException e) {
                     System.out.println("Removing offline daemon: " + id);
                     toRemove.add(id);
@@ -171,13 +168,43 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
 
         for (String id : toRemove) {
-            daemons.remove(id);
             fileRegistry.get(filename).remove(id);
-            lastHeartbeats.remove(id);
         }
 
-        System.out.println("Returning daemons for file " + filename + ": " + availableDaemons.size());
-        return availableDaemons;
+        // Sort daemons by load (lowest load first)
+        Collections.sort(daemonInfos);
+
+        System.out.println("Daemons for file " + filename + " sorted by load:");
+        for (DaemonInfo info : daemonInfos) {
+            try {
+                System.out.println("  - " + info.daemon.getDaemonId() + " (load: " + info.load + ")");
+            } catch (RemoteException e) {
+                // Ignore
+            }
+        }
+
+        // Extract the sorted daemons
+        List<DaemonService> sortedDaemons = daemonInfos.stream()
+                .map(info -> info.daemon)
+                .collect(Collectors.toList());
+
+        return sortedDaemons;
+    }
+
+    // Helper class to store daemon and its load for sorting
+    private static class DaemonInfo implements Comparable<DaemonInfo> {
+        DaemonService daemon;
+        int load;
+
+        DaemonInfo(DaemonService daemon, int load) {
+            this.daemon = daemon;
+            this.load = load;
+        }
+
+        @Override
+        public int compareTo(DaemonInfo other) {
+            return Integer.compare(this.load, other.load);
+        }
     }
 
     @Override

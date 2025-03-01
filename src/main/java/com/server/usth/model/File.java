@@ -13,7 +13,6 @@ public class File implements Serializable {
     private Long id;
 
     private String fileName;
-    private String fragmentName;
     private String fileSize;
     private String fileType;
     private String fileDate;

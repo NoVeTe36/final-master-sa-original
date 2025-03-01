@@ -31,15 +31,13 @@ public class FileUploadController {
             if (!dir.exists()) {
                 dir.mkdirs();
             }
-            // Save the file
+
             String filename = file.getOriginalFilename();
             Path path = Paths.get(uploadDirectory, filename);
             Files.write(path, file.getBytes());
 
-            // Register file with directory service
             directory.registerFile(filename, "local");
 
-            // Debugging: Print registered daemons
             List<DaemonService> daemons = directory.getDaemonsForFile(filename);
             System.out.println("Daemons assigned to " + filename + ": " + daemons.size());
 

@@ -1,6 +1,6 @@
 package com.server.usth;
 
-import com.server.usth.impl.Directory;
+import com.server.usth.services.Directory;
 import com.server.usth.services.DaemonService;
 
 import java.io.FileOutputStream;
