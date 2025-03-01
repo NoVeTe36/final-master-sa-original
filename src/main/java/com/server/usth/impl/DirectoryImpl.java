@@ -56,6 +56,46 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
     }
 
+    // Add these fields to DirectoryImpl class
+    private Map<String, Double> daemonSpeeds = new ConcurrentHashMap<>(); // in KB/s
+    private static final double DEFAULT_SPEED = 1000.0; // Default 1MB/s
+
+    // Add this method to update daemon speeds
+    @Override
+    public void reportDaemonSpeed(String daemonId, double speedKBps) throws RemoteException {
+        // Use exponential moving average to smooth out fluctuations
+        double currentSpeed = daemonSpeeds.getOrDefault(daemonId, DEFAULT_SPEED);
+        double newSpeed = (currentSpeed * 0.7) + (speedKBps * 0.3);
+        daemonSpeeds.put(daemonId, newSpeed);
+        System.out.println("Updated speed for " + daemonId + ": " + newSpeed + " KB/s");
+    }
+
+    // Modify DaemonInfo class to include speed
+//    private class DaemonInfo implements Comparable<DaemonInfo> {
+//        DaemonService daemon;
+//        int load;
+//        double speedKBps;
+//        String id;
+//
+//        DaemonInfo(DaemonService daemon, String id, int load) {
+//            this.daemon = daemon;
+//            this.id = id;
+//            this.load = load;
+//            this.speedKBps = daemonSpeeds.getOrDefault(id, DEFAULT_SPEED);
+//        }
+//
+//        // Calculate a score that prioritizes faster daemons with lower loads
+//        double getScore() {
+//            return (speedKBps / (load + 1));
+//        }
+//
+//        @Override
+//        public int compareTo(DaemonInfo other) {
+//            // Higher scores are better
+//            return Double.compare(other.getScore(), this.getScore());
+//        }
+//    }
+
     @Override
     public void incrementDaemonLoad(String daemonId) throws RemoteException {
         daemonLoads.computeIfAbsent(daemonId, k -> new AtomicInteger(0)).incrementAndGet();

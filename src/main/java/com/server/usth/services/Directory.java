@@ -6,6 +6,9 @@ import java.util.List;
 import java.util.Set;
 
 public interface Directory extends Remote {
+    // Add this method to update daemon speeds
+    void reportDaemonSpeed(String daemonId, double speedKBps) throws RemoteException;
+
     void incrementDaemonLoad(String daemonId) throws RemoteException;
 
     void decrementDaemonLoad(String daemonId) throws RemoteException;

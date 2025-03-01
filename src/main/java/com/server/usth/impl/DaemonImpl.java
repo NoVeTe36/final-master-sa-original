@@ -17,6 +17,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import static java.lang.Thread.sleep;
+
 public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
     private final String daemonId;
     private final String storageDirectory;
@@ -38,14 +40,18 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             return new byte[0];
         }
 
-        if (daemonId.equals("daemon2") || daemonId.equals("daemon4")) {
-            throw new RemoteException("Chunk download error");
-        }
-
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             raf.seek(offset);
             byte[] chunk = new byte[size];
             int bytesRead = raf.read(chunk);
+
+            try {
+                System.out.println("Simulating network delay for chunk at offset " + offset);
+                Thread.sleep(500); // Sleep for 500ms
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
             if (bytesRead < size && bytesRead > 0) {
                 byte[] partial = new byte[bytesRead];
                 System.arraycopy(chunk, 0, partial, 0, bytesRead);
@@ -215,21 +221,17 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
                 System.out.println("Requesting " + filename + " (" + fileSize + " bytes) from " +
                         sourceDaemon.getDaemonId());
 
-                if (fileSize > 50 * 1024 * 1024) { // 50MB threshold
-                    downloadLargeFile(filename, fileSize, sourceDaemon);
-                } else {
-                    byte[] data = sourceDaemon.downloadChunk(filename, 0, (int) fileSize);
-                    if (data != null && data.length > 0) {
-                        File file = new File(storageDirectory, filename);
-                        try (FileOutputStream fos = new FileOutputStream(file)) {
-                            fos.write(data);
-                        }
-                        System.out.println("Recovered file: " + filename);
-
-                        // Register the file
-                        directory.registerFile(filename, daemonId);
-                        return;
+                byte[] data = sourceDaemon.downloadChunk(filename, 0, (int) fileSize);
+                if (data != null && data.length > 0) {
+                    File file = new File(storageDirectory, filename);
+                    try (FileOutputStream fos = new FileOutputStream(file)) {
+                        fos.write(data);
                     }
+                    System.out.println("Recovered file: " + filename);
+
+                    // Register the file
+                    directory.registerFile(filename, daemonId);
+                    return;
                 }
             } catch (Exception e) {
                 System.err.println("Failed to recover " + filename + " from daemon " +
@@ -250,6 +252,9 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             for (int i = 0; i < numChunks; i++) {
                 long offset = i * (long) CHUNK_SIZE;
                 int size = (int) Math.min(CHUNK_SIZE, fileSize - offset);
+
+                sleep(1000); // Simulate slow download
+                System.out.println("Downloading chunk " + (i+1) + "/" + numChunks);
 
                 byte[] chunk = sourceDaemon.downloadChunk(filename, offset, size);
                 if (chunk != null && chunk.length > 0) {
