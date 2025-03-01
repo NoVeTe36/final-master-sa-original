@@ -56,33 +56,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
     }
 
-    private void checkHeartbeats() {
-        long currentTime = System.currentTimeMillis();
-        List<String> inactiveNodes = new ArrayList<>();
-
-        for (Map.Entry<String, Long> entry : lastHeartbeats.entrySet()) {
-            if (currentTime - entry.getValue() > HEARTBEAT_TIMEOUT) {
-                inactiveNodes.add(entry.getKey());
-            }
-        }
-
-        for (String nodeId : inactiveNodes) {
-            if (nodeId.startsWith("daemon")) {
-                daemons.remove(nodeId);
-                System.out.println("Daemon removed due to inactivity: " + nodeId);
-
-                for (Set<String> daemonSet : fileRegistry.values()) {
-                    daemonSet.remove(nodeId);
-                }
-            } else {
-                clients.remove(nodeId);
-                System.out.println("Client removed due to inactivity: " + nodeId);
-            }
-
-            lastHeartbeats.remove(nodeId);
-        }
-    }
-
     @Override
     public void incrementDaemonLoad(String daemonId) throws RemoteException {
         daemonLoads.computeIfAbsent(daemonId, k -> new AtomicInteger(0)).incrementAndGet();
@@ -136,42 +109,61 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         Set<String> daemonIds = fileRegistry.getOrDefault(filename, Collections.emptySet());
         List<DaemonInfo> daemonInfos = new ArrayList<>();
         List<String> toRemove = new ArrayList<>();
+        boolean isNewUpload = daemonIds.contains("local");
 
         // First check current heartbeats to avoid trying dead daemons
         long currentTime = System.currentTimeMillis();
-        for (String id : daemonIds) {
-            // Skip daemons that haven't sent a heartbeat recently
-            if (currentTime - lastHeartbeats.getOrDefault(id, 0L) > HEARTBEAT_TIMEOUT) {
-                System.out.println("Skipping inactive daemon: " + id);
-                toRemove.add(id);
-                continue;
-            }
 
-            DaemonService daemon = daemons.get(id);
-            if (daemon != null) {
-                try {
-                    // Verify daemon has the file by checking its size
-                    long fileSize = daemon.getFileSize(filename);
-                    if (fileSize > 0) {
-                        // Get the current load for this daemon
-                        int load = getDaemonLoad(id);
-                        daemonInfos.add(new DaemonInfo(daemon, load));
-                    } else {
-                        System.out.println("Daemon " + id + " doesn't have file: " + filename);
+        // If this is a new upload from server with "local" daemon, include all active daemons
+        if (isNewUpload) {
+            System.out.println("Handling new file upload: " + filename);
+            for (Map.Entry<String, DaemonService> entry : daemons.entrySet()) {
+                String id = entry.getKey();
+                if (currentTime - lastHeartbeats.getOrDefault(id, 0L) <= HEARTBEAT_TIMEOUT) {
+                    DaemonService daemon = entry.getValue();
+                    // Get the current load for this daemon
+                    int load = getDaemonLoad(id);
+                    daemonInfos.add(new DaemonInfo(daemon, load));
+                }
+            }
+        } else {
+            // Regular file download - verify daemons have the file
+            for (String id : daemonIds) {
+                // Skip daemons that haven't sent a heartbeat recently
+                if (currentTime - lastHeartbeats.getOrDefault(id, 0L) > HEARTBEAT_TIMEOUT) {
+                    System.out.println("Skipping inactive daemon: " + id);
+                    toRemove.add(id);
+                    continue;
+                }
+
+                DaemonService daemon = daemons.get(id);
+                if (daemon != null) {
+                    try {
+                        // Verify daemon has the file by checking its size
+                        long fileSize = daemon.getFileSize(filename);
+                        if (fileSize > 0) {
+                            // Get the current load for this daemon
+                            int load = getDaemonLoad(id);
+                            daemonInfos.add(new DaemonInfo(daemon, load));
+                        } else {
+                            System.out.println("Daemon " + id + " doesn't have file: " + filename);
+                            toRemove.add(id);
+                        }
+                    } catch (RemoteException e) {
+                        System.out.println("Removing offline daemon: " + id);
                         toRemove.add(id);
                     }
-                } catch (RemoteException e) {
-                    System.out.println("Removing offline daemon: " + id);
-                    toRemove.add(id);
                 }
             }
         }
 
         for (String id : toRemove) {
-            fileRegistry.get(filename).remove(id);
+            Set<String> daemonSet = fileRegistry.get(filename);
+            if (daemonSet != null) {
+                daemonSet.remove(id);
+            }
         }
 
-        // Sort daemons by load (lowest load first)
         Collections.sort(daemonInfos);
 
         System.out.println("Daemons for file " + filename + " sorted by load:");
@@ -179,7 +171,7 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
             try {
                 System.out.println("  - " + info.daemon.getDaemonId() + " (load: " + info.load + ")");
             } catch (RemoteException e) {
-                // Ignore
+                System.out.println("  - " + info.daemon + " (load: " + info.load + ")");
             }
         }
 
@@ -191,7 +183,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         return sortedDaemons;
     }
 
-    // Helper class to store daemon and its load for sorting
     private static class DaemonInfo implements Comparable<DaemonInfo> {
         DaemonService daemon;
         int load;
@@ -210,6 +201,33 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     @Override
     public Set<String> getAvailableFiles() {
         return fileRegistry.keySet();
+    }
+
+    private void checkHeartbeats() {
+        long currentTime = System.currentTimeMillis();
+        List<String> inactiveNodes = new ArrayList<>();
+
+        for (Map.Entry<String, Long> entry : lastHeartbeats.entrySet()) {
+            if (currentTime - entry.getValue() > HEARTBEAT_TIMEOUT) {
+                inactiveNodes.add(entry.getKey());
+            }
+        }
+
+        for (String nodeId : inactiveNodes) {
+            if (nodeId.startsWith("daemon")) {
+                daemons.remove(nodeId);
+                System.out.println("Daemon removed due to inactivity: " + nodeId);
+
+                for (Set<String> daemonSet : fileRegistry.values()) {
+                    daemonSet.remove(nodeId);
+                }
+            } else {
+                clients.remove(nodeId);
+                System.out.println("Client removed due to inactivity: " + nodeId);
+            }
+
+            lastHeartbeats.remove(nodeId);
+        }
     }
 
     @Override

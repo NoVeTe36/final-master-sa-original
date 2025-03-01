@@ -32,53 +32,28 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         this.storageDirectory = storageDirectory;
     }
 
-    @Override
     public byte[] downloadChunk(String fileName, long offset, int size) throws RemoteException {
         File file = new File(storageDirectory, fileName);
         if (!file.exists() || size <= 0) {
-            System.out.println("[" + daemonId + "] File not found or invalid size: " + fileName);
             return new byte[0];
         }
 
-        // Simulate failures for daemon2 and daemon4
         if (daemonId.equals("daemon2") || daemonId.equals("daemon4")) {
             throw new RemoteException("Chunk download error");
         }
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
-            // Check if the file is large enough
-            if (raf.length() < offset) {
-                System.out.println("[" + daemonId + "] Requested offset beyond file size: " + offset + " > " + raf.length());
-                return new byte[0];
-            }
-
-            // Seek to the correct position
             raf.seek(offset);
-
-            // Calculate actual bytes to read (don't exceed file length)
-            int bytesToRead = (int) Math.min(size, raf.length() - offset);
-            byte[] chunk = new byte[bytesToRead];
-
-            // Read the data
+            byte[] chunk = new byte[size];
             int bytesRead = raf.read(chunk);
-
-            if (bytesRead < 0) {
-                // End of file reached unexpectedly
-                System.out.println("[" + daemonId + "] End of file reached unexpectedly");
-                return new byte[0];
-            } else if (bytesRead < bytesToRead) {
-                // Partial read, return only what was read
+            if (bytesRead < size && bytesRead > 0) {
                 byte[] partial = new byte[bytesRead];
                 System.arraycopy(chunk, 0, partial, 0, bytesRead);
-                System.out.println("[" + daemonId + "] Partial read: " + bytesRead + "/" + bytesToRead + " bytes");
                 return partial;
             }
-
-            System.out.println("[" + daemonId + "] Successfully served chunk: offset=" + offset + ", size=" + bytesRead);
             return chunk;
         } catch (IOException e) {
-            System.out.println("[" + daemonId + "] Error reading file: " + e.getMessage());
-            throw new RemoteException("Chunk read error: " + e.getMessage(), e);
+            throw new RemoteException("Chunk read error", e);
         }
     }
 
