@@ -40,14 +40,24 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             return new byte[0];
         }
 
+        if (daemonId.equals("daemon4")) {
+            throw new RemoteException("Connection error");
+        }
+
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             raf.seek(offset);
             byte[] chunk = new byte[size];
             int bytesRead = raf.read(chunk);
-
             try {
-                System.out.println("Simulating network delay for chunk at offset " + offset);
-                Thread.sleep(500); // Sleep for 500ms
+                if (daemonId.equals("daemon1")) {
+                    sleep(3000); // Simulate slow download
+                }
+                if (daemonId.equals("daemon2")) {
+                    sleep(1000); // Simulate slow download
+                }
+                if (daemonId.equals("daemon3")) {
+                    sleep(500); // Simulate slow download
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -98,14 +108,12 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             registry = LocateRegistry.getRegistry("localhost", 1099);
             directory = (Directory) registry.lookup("Directory");
 
-            // Bind this daemon in the registry for discovery
             registry.rebind(daemonId, this);
 
             // Register with directory service
             directory.registerDaemon(daemonId, this);
             System.out.println("Daemon " + daemonId + " is running...");
 
-            // Create storage directory if it doesn't exist
             File storage = new File(storageDirectory);
             if (!storage.exists()) {
                 storage.mkdirs();
@@ -239,37 +247,6 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
             }
         }
         System.err.println("Failed to recover " + filename + " from any daemon.");
-    }
-
-    private void downloadLargeFile(String filename, long fileSize, DaemonService sourceDaemon) throws Exception {
-        final int CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
-        int numChunks = (int) Math.ceil((double) fileSize / CHUNK_SIZE);
-
-        File outputFile = new File(storageDirectory, filename);
-        try (RandomAccessFile raf = new RandomAccessFile(outputFile, "rw")) {
-            raf.setLength(fileSize); // Pre-allocate file
-
-            for (int i = 0; i < numChunks; i++) {
-                long offset = i * (long) CHUNK_SIZE;
-                int size = (int) Math.min(CHUNK_SIZE, fileSize - offset);
-
-                sleep(1000); // Simulate slow download
-                System.out.println("Downloading chunk " + (i+1) + "/" + numChunks);
-
-                byte[] chunk = sourceDaemon.downloadChunk(filename, offset, size);
-                if (chunk != null && chunk.length > 0) {
-                    raf.seek(offset);
-                    raf.write(chunk);
-                    System.out.println("Downloaded chunk " + (i+1) + "/" + numChunks +
-                            " of " + filename + " (" + chunk.length + " bytes)");
-                } else {
-                    throw new IOException("Failed to download chunk " + i);
-                }
-            }
-        }
-
-        System.out.println("Successfully downloaded large file: " + filename);
-        directory.registerFile(filename, daemonId);
     }
 
     private void shutdown() {

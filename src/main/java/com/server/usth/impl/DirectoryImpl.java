@@ -5,6 +5,8 @@ import com.server.usth.services.Directory;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Autowired;
+
+import java.io.Serial;
 import java.rmi.RemoteException;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
@@ -22,8 +24,9 @@ import java.util.stream.Collectors;
 
 @Service
 public class DirectoryImpl extends UnicastRemoteObject implements Directory {
+    @Serial
     private static final long serialVersionUID = 1L;
-    private static final long HEARTBEAT_TIMEOUT = 30000; // 30 seconds timeout
+    private static final long HEARTBEAT_TIMEOUT = 30000;
 
     private final Map<String, DaemonService> daemons = new ConcurrentHashMap<>();
     private final Map<String, DaemonService> clients = new ConcurrentHashMap<>();
@@ -31,8 +34,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     private final Map<String, Long> lastHeartbeats = new ConcurrentHashMap<>();
 
     private final Map<String, AtomicInteger> daemonLoads = new ConcurrentHashMap<>();
-
-    private ScheduledExecutorService heartbeatChecker;
 
     @Autowired
     private Registry rmiRegistry;
@@ -48,7 +49,7 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
             System.out.println("Directory Service bound to RMI registry");
 
             // Start the heartbeat checker thread
-            heartbeatChecker = Executors.newSingleThreadScheduledExecutor();
+            ScheduledExecutorService heartbeatChecker = Executors.newSingleThreadScheduledExecutor();
             heartbeatChecker.scheduleAtFixedRate(this::checkHeartbeats, 10, 10, TimeUnit.SECONDS);
         } catch (Exception e) {
             System.err.println("Error binding Directory Service: " + e.getMessage());
@@ -56,11 +57,9 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         }
     }
 
-    // Add these fields to DirectoryImpl class
     private Map<String, Double> daemonSpeeds = new ConcurrentHashMap<>(); // in KB/s
     private static final double DEFAULT_SPEED = 1000.0; // Default 1MB/s
 
-    // Add this method to update daemon speeds
     @Override
     public void reportDaemonSpeed(String daemonId, double speedKBps) throws RemoteException {
         // Use exponential moving average to smooth out fluctuations
@@ -70,31 +69,28 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         System.out.println("Updated speed for " + daemonId + ": " + newSpeed + " KB/s");
     }
 
-    // Modify DaemonInfo class to include speed
-//    private class DaemonInfo implements Comparable<DaemonInfo> {
-//        DaemonService daemon;
-//        int load;
-//        double speedKBps;
-//        String id;
-//
-//        DaemonInfo(DaemonService daemon, String id, int load) {
-//            this.daemon = daemon;
-//            this.id = id;
-//            this.load = load;
-//            this.speedKBps = daemonSpeeds.getOrDefault(id, DEFAULT_SPEED);
-//        }
-//
-//        // Calculate a score that prioritizes faster daemons with lower loads
-//        double getScore() {
-//            return (speedKBps / (load + 1));
-//        }
-//
-//        @Override
-//        public int compareTo(DaemonInfo other) {
-//            // Higher scores are better
-//            return Double.compare(other.getScore(), this.getScore());
-//        }
-//    }
+    private class DaemonInfo implements Comparable<DaemonInfo> {
+        DaemonService daemon;
+        int load;
+        double speedKBps;
+        String id;
+
+        DaemonInfo(DaemonService daemon, String id, int load) {
+            this.daemon = daemon;
+            this.id = id;
+            this.load = load;
+            this.speedKBps = daemonSpeeds.getOrDefault(id, DEFAULT_SPEED);
+        }
+
+        double getScore() {
+            return (speedKBps / (load + 1));
+        }
+
+        @Override
+        public int compareTo(DaemonInfo other) {
+            return Double.compare(other.getScore(), this.getScore());
+        }
+    }
 
     @Override
     public void incrementDaemonLoad(String daemonId) throws RemoteException {
@@ -130,7 +126,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
                 System.out.println("File " + filename + " assigned to daemon: " + daemonId);
             }
         } else {
-            // Otherwise, register as a client
             clients.put(daemonId, daemon);
             System.out.println("Client registered: " + daemonId);
         }
@@ -151,10 +146,9 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         List<String> toRemove = new ArrayList<>();
         boolean isNewUpload = daemonIds.contains("local");
 
-        // First check current heartbeats to avoid trying dead daemons
+        // Check current heartbeats to avoid trying dead daemons
         long currentTime = System.currentTimeMillis();
 
-        // If this is a new upload from server with "local" daemon, include all active daemons
         if (isNewUpload) {
             System.out.println("Handling new file upload: " + filename);
             for (Map.Entry<String, DaemonService> entry : daemons.entrySet()) {
@@ -163,11 +157,10 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
                     DaemonService daemon = entry.getValue();
                     // Get the current load for this daemon
                     int load = getDaemonLoad(id);
-                    daemonInfos.add(new DaemonInfo(daemon, load));
+                    daemonInfos.add(new DaemonInfo(daemon, id, load));
                 }
             }
         } else {
-            // Regular file download - verify daemons have the file
             for (String id : daemonIds) {
                 // Skip daemons that haven't sent a heartbeat recently
                 if (currentTime - lastHeartbeats.getOrDefault(id, 0L) > HEARTBEAT_TIMEOUT) {
@@ -179,12 +172,10 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
                 DaemonService daemon = daemons.get(id);
                 if (daemon != null) {
                     try {
-                        // Verify daemon has the file by checking its size
                         long fileSize = daemon.getFileSize(filename);
                         if (fileSize > 0) {
-                            // Get the current load for this daemon
                             int load = getDaemonLoad(id);
-                            daemonInfos.add(new DaemonInfo(daemon, load));
+                            daemonInfos.add(new DaemonInfo(daemon, id, load));
                         } else {
                             System.out.println("Daemon " + id + " doesn't have file: " + filename);
                             toRemove.add(id);
@@ -221,21 +212,6 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
                 .collect(Collectors.toList());
 
         return sortedDaemons;
-    }
-
-    private static class DaemonInfo implements Comparable<DaemonInfo> {
-        DaemonService daemon;
-        int load;
-
-        DaemonInfo(DaemonService daemon, int load) {
-            this.daemon = daemon;
-            this.load = load;
-        }
-
-        @Override
-        public int compareTo(DaemonInfo other) {
-            return Integer.compare(this.load, other.load);
-        }
     }
 
     @Override

@@ -4,14 +4,16 @@ import com.server.usth.services.Directory;
 import com.server.usth.services.DaemonService;
 
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.sql.Time;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 
@@ -20,7 +22,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-import static java.lang.Thread.sleep;
 
 public class ClientDownloader extends UnicastRemoteObject implements DaemonService {
     private final String daemonId;
@@ -29,12 +30,49 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
     private Directory directory;
     private final Set<String> failedDaemons = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, Long> downloadStatus = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, AtomicInteger> fragmentsPerDaemon = new ConcurrentHashMap<>();
+    private final Map<String, Double> daemonSpeedMap = new ConcurrentHashMap<>();
 
     public ClientDownloader(String daemonId, String filename, String downloadPath) throws RemoteException {
         this.daemonId = daemonId;
         this.filename = filename;
         this.downloadPath = downloadPath;
     }
+
+    private static class ChunkInfo {
+        long offset;
+        int size;
+
+        ChunkInfo(long offset, int size) {
+            this.offset = offset;
+            this.size = size;
+        }
+    }
+
+    @Override
+    public long getFileSize(String file) throws RemoteException {
+        if (!file.equals(filename)) {
+            return 0;
+        }
+
+        File localFile = new File(downloadPath, file);
+        if (!localFile.exists()) {
+            return 0;
+        }
+
+        return localFile.length();
+    }
+
+    @Override
+    public void receiveFile(String file, byte[] data) throws RemoteException {
+        System.out.println("Received file: " + file);
+    }
+
+    @Override
+    public String getDaemonId() throws RemoteException {
+        return daemonId;
+    }
+
 
     public void startClient() throws Exception {
         Registry registry = LocateRegistry.getRegistry("localhost", 1099);
@@ -127,10 +165,17 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
             final int CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
             int numChunks = (int) Math.ceil((double) fileSize / CHUNK_SIZE);
 
-            ExecutorService executor = Executors.newFixedThreadPool(daemons.size());
-            byte[][] fileChunks = new byte[numChunks][];
+            // Pre-allocate the output file
+            File outputFile = new File(downloadPath, filename);
+            try (FileChannel channel = new RandomAccessFile(outputFile, "rw").getChannel()) {
+                channel.truncate(fileSize);
+            }
 
+            ExecutorService executor = Executors.newFixedThreadPool(daemons.size());
             CountDownLatch latch = new CountDownLatch(numChunks);
+
+            // Track failed chunks with their offset and size
+            ConcurrentMap<Integer, ChunkInfo> failedChunks = new ConcurrentHashMap<>();
 
             for (int i = 0; i < numChunks; i++) {
                 final int chunkIndex = i;
@@ -139,30 +184,46 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 
                 executor.submit(() -> {
                     try {
-                        DaemonService daemon = daemons.get(chunkIndex % daemons.size());
+                        DaemonService daemon = selectDaemonForChunk(daemons, chunkIndex);
                         String currentDaemonId = daemon.getDaemonId();
+
+                        // Track fragment count for this daemon
+                        fragmentsPerDaemon.computeIfAbsent(currentDaemonId, k -> new AtomicInteger(0))
+                                .incrementAndGet();
+
                         System.out.println("Downloading chunk " + chunkIndex + " from: " +
                                 currentDaemonId + " (offset: " + offset +
                                 ", size: " + size + ")");
 
                         // Only download if size is valid
                         if (size > 0) {
+                            long startTimeMs = System.currentTimeMillis();
                             byte[] chunk = daemon.downloadChunk(filename, offset, size);
-                            fileChunks[chunkIndex] = chunk;
-                            downloadStatus.put(currentDaemonId, (long) chunk.length);
-                        } else {
-                            fileChunks[chunkIndex] = new byte[0];
+                            long endTimeMs = System.currentTimeMillis();
+
+                            // Measure and report speed
+                            measureAndReportSpeed(currentDaemonId, chunk.length, endTimeMs - startTimeMs);
+
+                            // Write directly to file using FileChannel
+                            try (FileChannel channel = new RandomAccessFile(outputFile, "rw").getChannel()) {
+                                ByteBuffer buffer = ByteBuffer.wrap(chunk);
+                                channel.position(offset);
+                                channel.write(buffer);
+                            }
+
+                            downloadStatus.put(currentDaemonId,
+                                    downloadStatus.getOrDefault(currentDaemonId, 0L) + chunk.length);
                         }
                     } catch (Exception e) {
+                        System.out.println("Error downloading chunk " + chunkIndex + ": " + e.getMessage());
                         try {
-                            String failedDaemonId = daemons.get(chunkIndex % daemons.size()).getDaemonId();
-                            System.out.println("*** ERROR: Daemon " + failedDaemonId +
-                                    " crashed during download of chunk " + chunkIndex + " ***");
-                            System.out.println("Error message: " + e.getMessage());
-                            failedDaemons.add(failedDaemonId);
-                        } catch (RemoteException ex) {
-                            System.out.println("Failed to identify daemon for chunk " + chunkIndex);
-                            ex.printStackTrace();
+                            String daemonId = selectDaemonForChunk(daemons, chunkIndex).getDaemonId();
+                            failedDaemons.add(daemonId);
+                            // Store failed chunk info for retry
+                            failedChunks.put(chunkIndex, new ChunkInfo(offset, size));
+                            System.out.println("Added failed daemon: " + daemonId + " for chunk: " + chunkIndex);
+                        } catch (Exception ex) {
+                            System.out.println("Could not get daemon ID: " + ex.getMessage());
                         }
                     } finally {
                         latch.countDown();
@@ -177,22 +238,31 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
             Time endTime = new Time(System.currentTimeMillis());
             System.out.println("Download time: " + (endTime.getTime() - startTime.getTime()) + " ms");
 
-            mergeChunks(fileChunks);
-
-            // Retry failed downloads
-            if (!failedDaemons.isEmpty()) {
-                System.out.println("\n=== RETRYING DOWNLOADS FOR FAILED DAEMONS ===");
-                System.out.println("Failed daemons: " + failedDaemons);
-                retryFailedDownloads(daemons, fileSize, CHUNK_SIZE);
+            // Retry failed downloads if any
+            if (!failedChunks.isEmpty()) {
+                System.out.println("\n=== RETRYING " + failedChunks.size() + " FAILED CHUNKS ===");
+                retryFailedChunks(daemons, outputFile, failedChunks);
             }
+
+            // Print download statistics
+            System.out.println("\n=== DOWNLOAD STATISTICS ===");
+            System.out.println("Fragments handled by each daemon:");
+            fragmentsPerDaemon.forEach((daemonId, count) -> {
+                double speed = daemonSpeedMap.getOrDefault(daemonId, 0.0);
+                System.out.printf("- %s: %d fragments (%.2f KB/s)%n",
+                        daemonId, count.get(), speed);
+            });
+            System.out.println("===========================\n");
 
             directory.registerFile(filename, daemonId);
             System.out.println("Registered file: " + filename + " for daemon: " + daemonId);
+
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
+//    // this is the download without balancing and with file channel
 //    public void download(Time startTime) {
 //        try {
 //            List<DaemonService> daemons = directory.getDaemonsForFile(filename);
@@ -201,6 +271,7 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 //                return;
 //            }
 //
+//            // Get file size
 //            long fileSize = 0;
 //            for (DaemonService daemon : daemons) {
 //                try {
@@ -223,10 +294,15 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 //            final int CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
 //            int numChunks = (int) Math.ceil((double) fileSize / CHUNK_SIZE);
 //
-//            ExecutorService executor = Executors.newFixedThreadPool(daemons.size());
-//            byte[][] fileChunks = new byte[numChunks][];
+//            // Pre-allocate the output file
+//            File outputFile = new File(downloadPath, filename);
+//            try (FileChannel channel = new RandomAccessFile(outputFile, "rw").getChannel()) {
+//                channel.truncate(fileSize);
+//            }
 //
+//            ExecutorService executor = Executors.newFixedThreadPool(daemons.size());
 //            CountDownLatch latch = new CountDownLatch(numChunks);
+//            final ConcurrentMap<String, AtomicInteger> fragmentsPerDaemon = new ConcurrentHashMap<>();
 //
 //            for (int i = 0; i < numChunks; i++) {
 //                final int chunkIndex = i;
@@ -237,25 +313,36 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 //                    try {
 //                        DaemonService daemon = daemons.get(chunkIndex % daemons.size());
 //                        String currentDaemonId = daemon.getDaemonId();
+//
+//                        fragmentsPerDaemon.computeIfAbsent(currentDaemonId, k -> new AtomicInteger(0))
+//                                .incrementAndGet();
+//
 //                        System.out.println("Downloading chunk " + chunkIndex + " from: " +
 //                                currentDaemonId + " (offset: " + offset +
 //                                ", size: " + size + ")");
 //
-//                        // Only download if size is valid
 //                        if (size > 0) {
+//                            long startTimeMs = System.currentTimeMillis();
 //                            byte[] chunk = daemon.downloadChunk(filename, offset, size);
-//                            Time endTime = new Time(System.currentTimeMillis());
+//                            long endTimeMs = System.currentTimeMillis();
+//                            long downloadTimeMs = endTimeMs - startTimeMs;
 //
-//                            // Measure and report speed
-//                            measureAndReportSpeed(currentDaemonId, chunk.length, endTime.getTime() - startTime.getTime());
+//                            measureAndReportSpeed(currentDaemonId, chunk.length, downloadTimeMs);
 //
-//                            fileChunks[chunkIndex] = chunk;
-//                            downloadStatus.put(currentDaemonId, (long) chunk.length);
-//                        } else {
-//                            fileChunks[chunkIndex] = new byte[0];
+//                            System.out.println("Downloaded chunk " + chunkIndex + " in " +
+//                                    downloadTimeMs + "ms from " + currentDaemonId);
+//
+//                            try (FileChannel channel = new RandomAccessFile(outputFile, "rw").getChannel()) {
+//                                ByteBuffer buffer = ByteBuffer.wrap(chunk);
+//                                channel.position(offset);
+//                                channel.write(buffer);
+//                            }
+//
+//                            downloadStatus.put(currentDaemonId,
+//                                    downloadStatus.getOrDefault(currentDaemonId, 0L) + chunk.length);
 //                        }
 //                    } catch (Exception e) {
-//                        // Error handling code remains the same
+//                        System.out.println("Error downloading chunk " + chunkIndex + ": " + e.getMessage());
 //                    } finally {
 //                        latch.countDown();
 //                    }
@@ -269,45 +356,42 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
 //            Time endTime = new Time(System.currentTimeMillis());
 //            System.out.println("Download time: " + (endTime.getTime() - startTime.getTime()) + " ms");
 //
-//            mergeChunks(fileChunks);
-//
-//            // Retry failed downloads
-//            if (!failedDaemons.isEmpty()) {
-//                System.out.println("\n=== RETRYING DOWNLOADS FOR FAILED DAEMONS ===");
-//                System.out.println("Failed daemons: " + failedDaemons);
-//                retryFailedDownloads(daemons, fileSize, CHUNK_SIZE);
-//            }
+//            System.out.println("\n=== DOWNLOAD STATISTICS ===");
+//            System.out.println("Fragments handled by each daemon:");
+//            fragmentsPerDaemon.forEach((daemonId, count) -> {
+//                double speed = daemonSpeedMap.getOrDefault(daemonId, 0.0);
+//                System.out.printf("- %s: %d fragments (%.2f KB/s)%n",
+//                        daemonId, count.get(), speed);
+//            });
+//            System.out.println("===========================\n");
 //
 //            directory.registerFile(filename, daemonId);
-//            System.out.println("Registered file: " + filename + " for daemon: " + daemonId);
+//
 //        } catch (Exception e) {
 //            e.printStackTrace();
 //        }
 //    }
-//
-//
-//    private void measureAndReportSpeed(String daemonId, long bytesDownloaded, long timeMs) {
-//        try {
-//            if (timeMs > 0 && bytesDownloaded > 0) {
-//                double speedKBps = (bytesDownloaded / 1024.0) / (timeMs / 1000.0);
-//                directory.reportDaemonSpeed(daemonId, speedKBps);
-//                System.out.println("Measured speed for " + daemonId + ": " +
-//                        String.format("%.2f", speedKBps) + " KB/s");
-//            }
-//        } catch (Exception e) {
-//            System.out.println("Failed to report daemon speed: " + e.getMessage());
-//        }
-//    }
 
-    private void retryFailedDownloads(List<DaemonService> daemons, long fileSize, int chunkSize) {
-        if (failedDaemons.isEmpty()) {
-            return;
+    private void measureAndReportSpeed(String daemonId, long bytesDownloaded, long timeMs) {
+        try {
+            if (timeMs > 0 && bytesDownloaded > 0) {
+                double speedKBps = (bytesDownloaded / 1024.0) / (timeMs / 1000.0);
+
+                double currentSpeed = daemonSpeedMap.getOrDefault(daemonId, speedKBps);
+                double newSpeed = (currentSpeed * 0.7) + (speedKBps * 0.3); // Exponential moving average
+                daemonSpeedMap.put(daemonId, newSpeed);
+
+                directory.reportDaemonSpeed(daemonId, speedKBps);
+                System.out.println("Measured speed for " + daemonId + ": " +
+                        String.format("%.2f", speedKBps) + " KB/s");
+            }
+        } catch (Exception e) {
+            System.out.println("Failed to report daemon speed: " + e.getMessage());
         }
+    }
 
-        System.out.println("\n=== RETRYING DOWNLOADS FOR FAILED DAEMONS IN PARALLEL ===");
-        System.out.println("Failed daemons: " + failedDaemons);
-
-        // Find available daemons (excluding failed ones)
+    private void retryFailedChunks(List<DaemonService> daemons, File outputFile,
+                                   ConcurrentMap<Integer, ChunkInfo> failedChunks) {
         List<DaemonService> availableDaemons = daemons.stream()
                 .filter(d -> {
                     try {
@@ -323,82 +407,45 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
             return;
         }
 
-        // Create tasks and execute them in parallel
-        ExecutorService executor = Executors.newFixedThreadPool(failedDaemons.size());
-        CountDownLatch latch = new CountDownLatch(failedDaemons.size());
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(availableDaemons.size(), failedChunks.size()));
+        CountDownLatch latch = new CountDownLatch(failedChunks.size());
 
-        for (String failedDaemonId : failedDaemons) {
+        failedChunks.forEach((chunkIndex, chunkInfo) -> {
             executor.submit(() -> {
                 try {
-                    // Find the index of the failed daemon to determine chunk offset
-                    int daemonIndex = -1;
-                    for (int i = 0; i < daemons.size(); i++) {
-                        try {
-                            if (daemons.get(i).getDaemonId().equals(failedDaemonId)) {
-                                daemonIndex = i;
-                                break;
-                            }
-                        } catch (RemoteException e) {
-                            // Skip this daemon
-                        }
-                    }
+                    // Use round-robin for retry attempts
+                    DaemonService daemon = availableDaemons.get(chunkIndex % availableDaemons.size());
+                    String daemonId = daemon.getDaemonId();
 
-                    if (daemonIndex >= 0) {
-                        // Calculate chunk parameters
-                        long offset = daemonIndex * (long)chunkSize;
-                        int size = (int) Math.min(chunkSize, fileSize - offset);
+                    System.out.println("Retrying chunk " + chunkIndex + " from daemon " + daemonId);
 
-                        // Choose a random available daemon
-                        DaemonService alternativeDaemon = availableDaemons.get(
-                                (int)(Math.random() * availableDaemons.size()));
-                        String alternativeId = alternativeDaemon.getDaemonId();
+                    byte[] chunk = daemon.downloadChunk(filename, chunkInfo.offset, chunkInfo.size);
 
-                        System.out.println("PARALLEL RETRY: Chunk " + daemonIndex +
-                                " (failed daemon: " + failedDaemonId +
-                                ") using alternative daemon: " + alternativeId);
+                    // Write the chunk to file
+                    try (FileChannel channel = new RandomAccessFile(outputFile, "rw").getChannel()) {
+                        ByteBuffer buffer = ByteBuffer.wrap(chunk);
+                        channel.position(chunkInfo.offset);
+                        channel.write(buffer);
+                        System.out.println("Successfully retried chunk " + chunkIndex);
 
-                        if (size > 0) {
-                            byte[] chunk = alternativeDaemon.downloadChunk(filename, offset, size);
-
-                            synchronized (this) {
-                                try (RandomAccessFile raf = new RandomAccessFile(new File(downloadPath, filename), "rw")) {
-                                    raf.seek(offset);
-                                    raf.write(chunk);
-                                    System.out.println("Successfully recovered chunk " + daemonIndex +
-                                            " with " + alternativeId + " (" + chunk.length + " bytes)");
-                                }
-                            }
-                        }
+                        // Update statistics
+                        fragmentsPerDaemon.computeIfAbsent(daemonId, k -> new AtomicInteger(0))
+                                .incrementAndGet();
                     }
                 } catch (Exception e) {
-                    System.out.println("✗ Retry failed: " + e.getMessage());
+                    System.out.println("Retry failed for chunk " + chunkIndex + ": " + e.getMessage());
                 } finally {
                     latch.countDown();
                 }
             });
-        }
+        });
 
         try {
             latch.await(1, TimeUnit.MINUTES);
-            System.out.println("=== PARALLEL RETRY OPERATIONS COMPLETED ===");
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            System.out.println("Retry operation interrupted");
         }
         executor.shutdown();
-    }
-
-    private void mergeChunks(byte[][] fileChunks) {
-        try (FileOutputStream fos = new FileOutputStream(new File(downloadPath, filename))) {
-            for (byte[] chunk : fileChunks) {
-                if (chunk != null) {
-                    fos.write(chunk);
-                }
-            }
-            sleep(1000);
-            System.out.println("File downloaded to: " + downloadPath + "/" + filename);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
     }
 
     @Override
@@ -447,29 +494,39 @@ public class ClientDownloader extends UnicastRemoteObject implements DaemonServi
         }
     }
 
-    @Override
-    public long getFileSize(String file) throws RemoteException {
-        // Only serve the file we've downloaded
-        if (!file.equals(filename)) {
-            return 0;
+    private DaemonService selectDaemonForChunk(List<DaemonService> daemons, int chunkIndex) throws RemoteException {
+        // For first few chunks, use round-robin while collecting speed data
+        if (chunkIndex < daemons.size()) {
+            return daemons.get(chunkIndex % daemons.size());
         }
 
-        File localFile = new File(downloadPath, file);
-        if (!localFile.exists()) {
-            return 0;
+        // When we have enough data, use weighted selection
+        double totalWeight = 0;
+        for (DaemonService daemon : daemons) {
+            String id = daemon.getDaemonId();
+            double speed = daemonSpeedMap.getOrDefault(id, 1.0);
+            if (speed <= 0) speed = 0.1;
+            totalWeight += speed;
         }
 
-        return localFile.length();
-    }
+        double random = Math.random() * totalWeight;
+        double weightSum = 0;
 
-    @Override
-    public void receiveFile(String file, byte[] data) throws RemoteException {
-        System.out.println("Received file: " + file);
-    }
+        for (DaemonService daemon : daemons) {
+            String id = daemon.getDaemonId();
+            double speed = daemonSpeedMap.getOrDefault(id, 1.0);
+            if (speed <= 0) speed = 0.1;
 
-    @Override
-    public String getDaemonId() throws RemoteException {
-        return daemonId;
+            double weight = speed;
+            weightSum += weight;
+
+            if (random <= weightSum) {
+                System.out.println("Selected daemon " + id + " with speed " + speed + " KB/s");
+                return daemon;
+            }
+        }
+
+        return daemons.get(0);
     }
 
     public static void main(String[] args) {
