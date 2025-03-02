@@ -58,7 +58,7 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
     }
 
     private Map<String, Double> daemonSpeeds = new ConcurrentHashMap<>(); // in KB/s
-    private static final double DEFAULT_SPEED = 1000.0; // Default 1MB/s
+    private static final double DEFAULT_SPEED = 10000.0; // Default 1MB/s
 
     @Override
     public void reportDaemonSpeed(String daemonId, double speedKBps) throws RemoteException {
@@ -68,6 +68,14 @@ public class DirectoryImpl extends UnicastRemoteObject implements Directory {
         daemonSpeeds.put(daemonId, newSpeed);
         System.out.println("Updated speed for " + daemonId + ": " + newSpeed + " KB/s");
     }
+
+//Initial sleep of 1000ms (1s) for all daemons
+//Additional sleeps based on daemon ID (daemon1: 3000ms, daemon2: 1000ms, daemon3: 500ms)
+//Final sleep of 1000ms for all daemons
+//With a 1MB chunk size, these artificial delays create a speed bottleneck:
+//daemon1: 1MB / (1s + 3s + 1s) = ~204.8 KB/s
+//daemon2: 1MB / (1s + 1s + 1s) = ~341.3 KB/s
+//daemon3: 1MB / (1s + 0.5s + 1s) = ~409.6 KB/s
 
     private class DaemonInfo implements Comparable<DaemonInfo> {
         DaemonService daemon;

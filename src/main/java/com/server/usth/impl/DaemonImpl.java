@@ -41,24 +41,40 @@ public class DaemonImpl extends UnicastRemoteObject implements DaemonService {
         }
 
         if (daemonId.equals("daemon4")) {
-            throw new RemoteException("Connection error");
+            if (Math.random() < 0.3) {
+                throw new RemoteException("Random failure");
+            }
         }
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            try {
+                if (daemonId.startsWith("daemon")) {
+                    sleep(1000);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             raf.seek(offset);
             byte[] chunk = new byte[size];
             int bytesRead = raf.read(chunk);
             try {
                 if (daemonId.equals("daemon1")) {
-                    sleep(3000); // Simulate slow download
+                    sleep(3000);
                 }
                 if (daemonId.equals("daemon2")) {
-                    sleep(1000); // Simulate slow download
+                    sleep(1000);
                 }
                 if (daemonId.equals("daemon3")) {
-                    sleep(500); // Simulate slow download
+                    sleep(500);
                 }
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            try {
+                sleep(1000);
+            }
+            catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
 
